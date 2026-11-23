@@ -73,3 +73,35 @@ func ResolveOptionalSecretBytes(ctx context.Context, c client.Client, namespace 
 	}
 	return []byte(val), nil
 }
+
+// ResolveSecretBytes retrieves the raw byte content of a specific key from a named secret.
+func ResolveSecretBytes(ctx context.Context, c client.Client, namespace, secretName, key string) ([]byte, error) {
+	if secretName == "" {
+		return nil, fmt.Errorf("secretName cannot be empty")
+	}
+	if key == "" {
+		return nil, fmt.Errorf("key cannot be empty for secret %q", secretName)
+	}
+
+	var secret corev1.Secret
+	namespacedName := types.NamespacedName{
+		Namespace: namespace,
+		Name:      secretName,
+	}
+
+	if err := c.Get(ctx, namespacedName, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("secret %q not found in namespace %q: %w", secretName, namespace, err)
+		}
+		return nil, fmt.Errorf("failed to get secret %q in namespace %q: %w", secretName, namespace, err)
+	}
+
+	if val, exists := secret.Data[key]; exists {
+		return val, nil
+	}
+	if val, exists := secret.StringData[key]; exists {
+		return []byte(val), nil
+	}
+
+	return nil, fmt.Errorf("key %q not found in secret %q/%q", key, namespace, secretName)
+}

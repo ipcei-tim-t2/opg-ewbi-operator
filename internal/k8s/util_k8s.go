@@ -52,12 +52,12 @@ func CompareSameAZs(s1, s2 []v1beta1.ZoneDetails) bool {
 }
 
 // Build a Kubernetes client and dynamic client for the host cluster.
-// Supports both Zero-Trust OIDC M2M authentication (Keycloak/Entra ID) and legacy kubeconfig secrets.
+// Supports both Zero-Trust dynamic OIDC M2M authentication (Direct Spec or Hybrid Kubeconfig) and legacy kubeconfig secrets.
 func buildHostClient(ctx context.Context, fed *v1beta1.Federation, r client.Client, scheme *runtime.Scheme) (client.Client, dynamic.Interface, error) {
 	if fed.Spec.FederationData != nil && fed.Spec.FederationData.K8sOptions != nil {
 		k8sOpts := fed.Spec.FederationData.K8sOptions
 
-		// Case 1: Zero-Trust OIDC Authentication
+		// Case 1: Zero-Trust OIDC Authentication via CRD Spec
 		if k8sOpts.Auth != nil && k8sOpts.ClusterConnection != nil {
 			tokenResp, err := auth.DefaultTokenManager.GetToken(ctx, r, fed)
 			if err != nil {
@@ -96,17 +96,52 @@ func buildHostClient(ctx context.Context, fed *v1beta1.Federation, r client.Clie
 			return k8sClient, dynClient, nil
 		}
 
-		// Case 2: Legacy Kubeconfig Secret
+		// Case 2: Kubeconfig Secret (Supports both Hybrid OIDC Ingestion and Legacy Static credentials)
 		if k8sOpts.SecretName != "" {
 			kubeconfigBytes, err := GetKubeconfigFromSecret(ctx, r, k8sOpts.SecretName, fed.Namespace)
 			if err != nil {
 				return nil, nil, err
 			}
+
+			// Check if this kubeconfig has an OIDC auth-provider configuration (Hybrid Architecture)
+			oidcClusterCfg, oidcErr := auth.ExtractOidcClusterConfig(ctx, r, fed.Namespace, kubeconfigBytes, k8sOpts.ContextName, k8sOpts.SecretName)
+			if oidcErr == nil && oidcClusterCfg != nil {
+				// Hybrid Architecture: In-Memory OIDC Session Handover (Zero-Fork)
+				tokenResp, err := auth.DefaultTokenManager.GetToken(ctx, r, fed)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to obtain OIDC token for host cluster from kubeconfig session: %w", err)
+				}
+
+				restConfig := &rest.Config{
+					Host:        oidcClusterCfg.HostApiServerUrl,
+					BearerToken: tokenResp.AccessToken,
+					TLSClientConfig: rest.TLSClientConfig{
+						Insecure: oidcClusterCfg.InsecureSkipTLSVerify,
+						CAData:   oidcClusterCfg.CAData,
+					},
+				}
+
+				k8sClient, err := client.New(restConfig, client.Options{
+					Scheme: scheme,
+				})
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to create host client with in-memory OIDC: %w", err)
+				}
+
+				dynClient, err := dynamic.NewForConfig(restConfig)
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to create host dynamic client with in-memory OIDC: %w", err)
+				}
+
+				return k8sClient, dynClient, nil
+			}
+
+			// Fallback: Legacy static Kubeconfig (client-go built-in parser)
 			return BuildClientWithKubeconfig(kubeconfigBytes, k8sOpts.ContextName, scheme)
 		}
 	}
 
-	return nil, nil, errors.New("k8sOptions must specify either auth with clusterConnection or legacy secretName")
+	return nil, nil, errors.New("k8sOptions must specify either auth with clusterConnection or secretName")
 }
 
 // GetKubeconfigFromSecret retrieves the kubeconfig from the specified secret in the given namespace.
@@ -117,7 +152,13 @@ func GetKubeconfigFromSecret(ctx context.Context, client client.Client, secretNa
 	}
 	kubeconfigData, exists := secret.Data["kubeconfig"]
 	if !exists {
-		return nil, errors.New("Kubeconfig not found in secret")
+		kubeconfigData, exists = secret.Data["config"]
+	}
+	if !exists {
+		kubeconfigData, exists = secret.Data["kubeconfig.yaml"]
+	}
+	if !exists {
+		return nil, errors.New("Kubeconfig not found in secret (checked keys: kubeconfig, config, kubeconfig.yaml)")
 	}
 	return kubeconfigData, nil
 }

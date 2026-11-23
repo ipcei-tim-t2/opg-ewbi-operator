@@ -18,9 +18,6 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -73,23 +70,33 @@ func (m *mockExternalFederationClient) RenewalFederation(ctx context.Context, f 
 	return nil
 }
 
+type mockAuthReconcilerOidcClient struct {
+	accessToken string
+	expiresIn   int64
+}
+
+func (m *mockAuthReconcilerOidcClient) RequestToken(ctx context.Context, opts auth.TokenRequestOptions) (*auth.TokenResponse, error) {
+	now := time.Now()
+	return &auth.TokenResponse{
+		AccessToken: m.accessToken,
+		TokenType:   "Bearer",
+		ExpiresIn:   m.expiresIn,
+		IssuedAt:    now,
+		Expiry:      now.Add(time.Duration(m.expiresIn) * time.Second),
+	}, nil
+}
+
 func TestFederationReconciler_OIDCAuthentication(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 	require.NoError(t, v1beta1.AddToScheme(scheme))
 
-	// Mock Keycloak IdP server
-	idpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPost, r.Method)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"access_token": "mock-jwt-access-token",
-			"token_type":   "Bearer",
-			"expires_in":   300, // 5 minutes TTL
-		})
-	}))
-	defer idpServer.Close()
+	origTM := auth.DefaultTokenManager
+	auth.DefaultTokenManager = auth.NewTokenManager(&mockAuthReconcilerOidcClient{
+		accessToken: "mock-jwt-access-token",
+		expiresIn:   300,
+	})
+	defer func() { auth.DefaultTokenManager = origTM }()
 
 	// Local Secret created by External Secrets Operator
 	secret := &corev1.Secret{
@@ -120,7 +127,7 @@ func TestFederationReconciler_OIDCAuthentication(t *testing.T) {
 						InsecureSkipTLSVerify: true,
 					},
 					Auth: &v1beta1.OidcAuthOptions{
-						TokenUrl: idpServer.URL,
+						TokenUrl: "http://idp.local/token",
 						ClientId: "guest-operator",
 						ClientSecretRef: corev1.SecretKeySelector{
 							LocalObjectReference: corev1.LocalObjectReference{Name: "eso-synced-secret"},
@@ -151,7 +158,6 @@ func TestFederationReconciler_OIDCAuthentication(t *testing.T) {
 		K8sClient:              mockExt,
 	}
 
-	// Override getExternalClient to avoid real network calls during external client execution
 	ctx := context.Background()
 
 	// Invalidate any residual cache for this test
@@ -170,9 +176,6 @@ func TestFederationReconciler_OIDCAuthentication(t *testing.T) {
 		},
 	}
 
-	// Set extClient for K8sClient in Reconciler
-	// Note: in our test, we check that Reconcile successfully completes and schedules requeue
-	_ = mockExt
 	res, err := r.Reconcile(ctx, req)
 	require.NoError(t, err)
 
@@ -260,4 +263,118 @@ func TestFederationReconciler_OIDCAuthentication_MissingSecret(t *testing.T) {
 
 	require.NotNil(t, updatedFed.Status.TokenInfo)
 	assert.Equal(t, "AUTH_FAILED", updatedFed.Status.TokenInfo.AuthState)
+}
+
+func TestFederationReconciler_HybridKubeconfigOIDC(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+
+	origTM := auth.DefaultTokenManager
+	auth.DefaultTokenManager = auth.NewTokenManager(&mockAuthReconcilerOidcClient{
+		accessToken: "mock-hybrid-jwt-token",
+		expiresIn:   300,
+	})
+	defer func() { auth.DefaultTokenManager = origTM }()
+
+	// Secret containing Kubeconfig with OIDC auth-provider
+	kubeSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "partner-kube-secret",
+			Namespace: "guest-ns",
+		},
+		Data: map[string][]byte{
+			"kubeconfig": []byte(`
+apiVersion: v1
+clusters:
+- cluster:
+    server: https://host-k8s:6443
+    insecure-skip-tls-verify: true
+  name: host-cluster
+contexts:
+- context:
+    cluster: host-cluster
+    user: oidc-operator
+  name: host-context
+current-context: host-context
+kind: Config
+users:
+- name: oidc-operator
+  user:
+    auth-provider:
+      name: oidc
+      config:
+        idp-issuer-url: https://keycloak.telecomitalia.it:8443/realms/host
+        client-id: guest-operator
+        client-secret: my-secret
+`),
+		},
+	}
+
+	// Federation using standard GSMA spec: secretName + contextName, NO custom auth fields!
+	fed := &v1beta1.Federation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "fed-hybrid-test",
+			Namespace:  "guest-ns",
+			Finalizers: []string{v1beta1.FederationFinalizer},
+		},
+		Spec: v1beta1.FederationSpec{
+			FederationData: &v1beta1.FederationData{
+				RelationType:   string(v1beta1.FederationRelationGuest),
+				TechnologyType: string(v1beta1.FederationTechnologyK8s),
+				InitialDate:    metav1.Now(),
+				K8sOptions: &v1beta1.K8sOptions{
+					Namespace:   "host-ns",
+					SecretName:  "partner-kube-secret",
+					ContextName: "host-context",
+				},
+			},
+		},
+		Status: v1beta1.FederationStatus{
+			State: v1beta1.FederationStateAvailable,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(kubeSecret, fed).
+		WithStatusSubresource(&v1beta1.Federation{}).
+		Build()
+
+	r := &FederationReconciler{
+		Client:                 fakeClient,
+		Scheme:                 scheme,
+		OPGClientsMapInterface: opg.NewOPGClientsMap(),
+		K8sClient:              &mockExternalFederationClient{},
+	}
+
+	ctx := context.Background()
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: "guest-ns",
+			Name:      "fed-hybrid-test",
+		},
+	}
+
+	res, err := r.Reconcile(ctx, req)
+	require.NoError(t, err)
+
+	// Verify that RequeueAfter is scheduled around 80% of TTL (300s * 0.8 = 240s)
+	assert.True(t, res.RequeueAfter > 200*time.Second && res.RequeueAfter <= 240*time.Second,
+		"Expected RequeueAfter around 240s, got: %v", res.RequeueAfter)
+
+	// Verify status update in the CRD
+	var updatedFed v1beta1.Federation
+	err = fakeClient.Get(ctx, req.NamespacedName, &updatedFed)
+	require.NoError(t, err)
+
+	require.NotNil(t, updatedFed.Status.TokenInfo)
+	assert.Equal(t, "AUTHENTICATED", updatedFed.Status.TokenInfo.AuthState)
+	assert.False(t, updatedFed.Status.TokenInfo.TokenExpiryDate.IsZero())
+	assert.False(t, updatedFed.Status.TokenInfo.TokenIssuedAt.IsZero())
+
+	// Verify in-memory cache holds the token
+	cachedToken, err := auth.DefaultTokenManager.GetToken(ctx, fakeClient, &updatedFed)
+	require.NoError(t, err)
+	assert.Equal(t, "mock-hybrid-jwt-token", cachedToken.AccessToken)
 }

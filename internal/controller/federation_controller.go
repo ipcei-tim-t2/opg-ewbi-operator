@@ -311,24 +311,34 @@ func (r *FederationReconciler) Reconcile(
 		}
 	} else {
 		// Guest federation handling
-		// Handle Zero-Trust OIDC M2M authentication and token lifecycle if configured
+		// Handle Zero-Trust dynamic OIDC M2M authentication and token lifecycle (Direct Spec or Hybrid Kubeconfig)
 		var tokenRequeue time.Duration
-		if !isRest && fed.Spec.FederationData != nil && fed.Spec.FederationData.K8sOptions != nil && fed.Spec.FederationData.K8sOptions.Auth != nil {
-			tokenResp, tokenErr := auth.DefaultTokenManager.GetToken(ctx, r.Client, &fed)
-			if tokenErr != nil {
-				log.Error(tokenErr, ">>> [Federation][OIDC] Failed to authenticate with Host IdP", "name", fed.Name, "namespace", fed.Namespace)
+		if !isRest && fed.Spec.FederationData != nil && fed.Spec.FederationData.K8sOptions != nil {
+			isOidc, oidcErr := auth.IsOidcConfigured(ctx, r.Client, &fed)
+			if oidcErr != nil {
+				log.Error(oidcErr, ">>> [Federation][OIDC] Error inspecting OIDC configuration", "name", fed.Name, "namespace", fed.Namespace)
 				fed.Status.TokenInfo = &v1beta1.TokenInfo{
 					AuthState: "AUTH_FAILED",
 				}
-				return ctrl.Result{RequeueAfter: 15 * time.Second}, tokenErr
+				return ctrl.Result{RequeueAfter: 15 * time.Second}, oidcErr
 			}
-			fed.Status.TokenInfo = &v1beta1.TokenInfo{
-				TokenExpiryDate: metav1.NewTime(tokenResp.Expiry),
-				TokenIssuedAt:   metav1.NewTime(tokenResp.IssuedAt),
-				AuthState:       "AUTHENTICATED",
+			if isOidc {
+				tokenResp, tokenErr := auth.DefaultTokenManager.GetToken(ctx, r.Client, &fed)
+				if tokenErr != nil {
+					log.Error(tokenErr, ">>> [Federation][OIDC] Failed to authenticate with Host IdP", "name", fed.Name, "namespace", fed.Namespace)
+					fed.Status.TokenInfo = &v1beta1.TokenInfo{
+						AuthState: "AUTH_FAILED",
+					}
+					return ctrl.Result{RequeueAfter: 15 * time.Second}, tokenErr
+				}
+				fed.Status.TokenInfo = &v1beta1.TokenInfo{
+					TokenExpiryDate: metav1.NewTime(tokenResp.Expiry),
+					TokenIssuedAt:   metav1.NewTime(tokenResp.IssuedAt),
+					AuthState:       "AUTHENTICATED",
+				}
+				tokenRequeue = auth.CalculateRefreshDuration(tokenResp.IssuedAt, tokenResp.Expiry, time.Now(), auth.DefaultRefreshFactor)
+				log.Info(">>> [Federation][OIDC] Active M2M Session with Host IdP", "name", fed.Name, "namespace", fed.Namespace, "expiresAt", tokenResp.Expiry, "refreshIn", tokenRequeue)
 			}
-			tokenRequeue = auth.CalculateRefreshDuration(tokenResp.IssuedAt, tokenResp.Expiry, time.Now(), auth.DefaultRefreshFactor)
-			log.Info(">>> [Federation][OIDC] Active M2M Session with Host IdP", "name", fed.Name, "namespace", fed.Namespace, "expiresAt", tokenResp.Expiry, "refreshIn", tokenRequeue)
 		}
 
 		// New Federation: Create it on the host

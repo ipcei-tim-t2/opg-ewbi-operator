@@ -17,10 +17,11 @@ limitations under the License.
 package auth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -28,11 +29,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type roundTripperFunc func(req *http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 func TestRequestToken(t *testing.T) {
 	t.Run("Successfully requests and parses token", func(t *testing.T) {
 		var receivedGrantType, receivedClientID, receivedClientSecret, receivedAudience, receivedScope string
 
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mockTransport := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			assert.Equal(t, http.MethodPost, r.Method)
 			assert.Equal(t, "application/x-www-form-urlencoded", r.Header.Get("Content-Type"))
 
@@ -45,20 +52,24 @@ func TestRequestToken(t *testing.T) {
 			receivedAudience = r.FormValue("audience")
 			receivedScope = r.FormValue("scope")
 
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]any{
+			body, _ := json.Marshal(map[string]any{
 				"access_token": "mock-jwt-bearer-token-12345",
 				"token_type":   "Bearer",
 				"expires_in":   300,
 				"scope":        "openid",
 			})
-		}))
-		defer server.Close()
 
-		client := NewHTTPTokenClient(nil)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		})
+
+		httpClient := &http.Client{Transport: mockTransport}
+		client := NewHTTPTokenClient(httpClient)
 		opts := TokenRequestOptions{
-			TokenURL:     server.URL,
+			TokenURL:     "http://keycloak.test/protocol/openid-connect/token",
 			ClientID:     "guest-operator-client",
 			ClientSecret: "super-secret-from-eso",
 			Audience:     "https://host-controlplane:6443",
@@ -84,19 +95,22 @@ func TestRequestToken(t *testing.T) {
 	})
 
 	t.Run("Fails on IdP 401 Unauthorized", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]string{
+		mockTransport := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			body, _ := json.Marshal(map[string]string{
 				"error":             "unauthorized_client",
 				"error_description": "Invalid client secret provided",
 			})
-		}))
-		defer server.Close()
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(bytes.NewReader(body)),
+			}, nil
+		})
 
-		client := NewHTTPTokenClient(nil)
+		httpClient := &http.Client{Transport: mockTransport}
+		client := NewHTTPTokenClient(httpClient)
 		opts := TokenRequestOptions{
-			TokenURL:     server.URL,
+			TokenURL:     "http://keycloak.test/protocol/openid-connect/token",
 			ClientID:     "guest-operator",
 			ClientSecret: "invalid-secret",
 		}
